@@ -1,114 +1,85 @@
-name: Build ImmortalWrt for 360P2 (Fixed)
+name: Build ImmortalWRT for 360P2 with Print Support
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
-    
-    env:
-      FORCE_UNSAFE_CONFIGURE: 1
-      DEBIAN_FRONTEND: noninteractive
-      
+    runs-on: ubuntu-latest
+
     steps:
-    - name: Checkout ImmortalWrt
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        repository: immortalwrt/immortalwrt
-        ref: v23.05.3
-        submodules: recursive
-        fetch-depth: 0
 
-    - name: Install Build Dependencies
+    - name: Initialize environment
       run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext \
-        libssl-dev libxml-parser-perl unzip python3 rsync wget subversion mercurial \
-        gperf bison flex texinfo dos2unix libtool-bin u-boot-tools lzma-dev zlib1g-dev \
-        libc6-dev-i386 g++-multilib
-        
-        # Python 兼容性修复
-        sudo ln -sf /usr/bin/python3 /usr/bin/python
-        python -m pip install --upgrade pip
-        pip install future
+        sudo apt update
+        sudo apt install -y build-essential clang flex bison g++ \
+        gawk gcc-multilib gettext git libncurses5-dev libssl-dev \
+        python3-distutils rsync unzip zlib1g-dev file wget
 
-    - name: Apply Critical Patches
+    - name: Clone ImmortalWRT source
+      run: git clone https://github.com/immortalwrt/immortalwrt -b openwrt-24.10
+
+    - name: Configure feeds
       run: |
-        # procd 修复
-        [ -f "package/system/procd/Makefile" ] && sed -i 's/-Werror //' package/system/procd/Makefile
-        
-        # hostapd 修复
-        [ -f "package/network/services/hostapd/files/hostapd-full.config" ] && \
-          echo "CONFIG_WPA_MSG_MIN_PRIORITY=3" >> package/network/services/hostapd/files/hostapd-full.config
-        
-        # Ubuntu 22.04 专属修复
-        [ -f "package/libs/libnl-tiny/Makefile" ] && \
-          sed -i 's/ -Wno-format-truncation//' package/libs/libnl-tiny/Makefile
-          
-        [ -f "package/network/utils/iwinfo/Makefile" ] && \
-          sed -i 's/ -Wno-format-truncation//' package/network/utils/iwinfo/Makefile
+        cd immortalwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
 
-    - name: Configure Target
+    - name: Custom configuration
       run: |
-        # 基础配置
-        echo "CONFIG_TARGET_ramips=y" > .config
-        echo "CONFIG_TARGET_ramips_mt76x8=y" >> .config
-        echo "CONFIG_TARGET_ramips_mt76x8_DEVICE_360_360p2=y" >> .config
-        echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
-        
-        # 空间优化
-        echo "# CONFIG_IPV6 is not set" >> .config
-        echo "# CONFIG_PACKAGE_ppp is not set" >> .config
-        echo "# CONFIG_PACKAGE_firewall is not set" >> .config
-        echo "# CONFIG_PACKAGE_odhcpd is not set" >> .config
-        
-        # 核心功能
-        echo "CONFIG_PACKAGE_luci=y" >> .config
-        echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
-        echo "CONFIG_PACKAGE_avahi-daemon=y" >> .config
-        echo "CONFIG_PACKAGE_cups=y" >> .config
-        echo "CONFIG_PACKAGE_kmod-usb-printer=y" >> .config
-        
-        # 避免问题组件
-        echo "# CONFIG_PACKAGE_procd-ujail is not set" >> .config
-        
-        # 生成配置
-        make defconfig
-        make oldconfig
+        cd immortalwrt
+        cat <<EOF > .config
+        #
+        # Basic configuration
+        #
+        CONFIG_TARGET_ramips=y
+        CONFIG_TARGET_ramips_mt7628=y
+        CONFIG_TARGET_ramips_mt7628_DEVICE_360p2=y
 
-    - name: Compile Firmware
+        #
+        # Network features
+        #
+        CONFIG_PACKAGE_dnsmasq=y
+        CONFIG_PACKAGE_firewall=y
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-app-firewall=y
+        CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+        CONFIG_PACKAGE_luci-i18n-opkg-zh-cn=y
+
+        #
+        # Print services
+        #
+        CONFIG_PACKAGE_cups=y
+        CONFIG_PACKAGE_cups-filters=y
+        CONFIG_PACKAGE_cups-bsd=y
+        CONFIG_PACKAGE_luci-app-cups=y
+        CONFIG_PACKAGE_luci-i18n-cups-zh-cn=y
+        CONFIG_PACKAGE_p910nd=y
+        CONFIG_PACKAGE_gutenprint=y
+
+        #
+        # System optimization
+        #
+        CONFIG_TARGET_ROOTFS_PARTSIZE=16
+        CONFIG_TARGET_ROOTFS_SQUASHFS=y
+        CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=131072
+        EOF
+
+    - name: Make download
       run: |
-        # 分阶段编译
-        make tools/compile -j$(nproc) V=s
-        make toolchain/compile -j$(nproc) V=s
-        make -j$(nproc) V=s 2>&1 | tee build.log || true
-        
-        # 关键组件单独编译
-        make -j1 V=s package/system/procd/compile
-        make -j1 V=s package/system/opkg/compile
-        
-        # 最终打包
-        make -j1 V=s package/install
-        make -j1 V=s target/install
+        cd immortalwrt
+        make download -j8
 
-    - name: Check Firmware
+    - name: Compile firmware
       run: |
-        FIRMWARE="bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin"
-        if [ -f "$FIRMWARE" ]; then
-          SIZE=$(stat -c%s "$FIRMWARE")
-          echo "Firmware generated: $SIZE bytes"
-        else
-          echo "::error::Firmware not found!"
-          find bin/targets/ramips/mt76x8/ -type f | xargs ls -lh
-          exit 1
-        fi
+        cd immortalwrt
+        make -j$(nproc) || make -j1 V=s
 
-    - name: Upload Artifact
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: immortalwrt-360p2
-        path: bin/targets/ramips/mt76x8/*.bin
+        name: immortalwrt-360p2-print
+        path: immortalwrt/bin/targets/ramips/mt7628/

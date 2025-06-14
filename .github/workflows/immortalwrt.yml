@@ -37,10 +37,6 @@ jobs:
         python -m pip install --upgrade pip
         pip install future
 
-        # 修复时间同步问题
-        sudo timedatectl set-ntp on
-        sudo service systemd-timesyncd restart
-
     - name: Apply Critical Patches
       run: |
         # procd 修复

@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for 360P2 (Fixed)
+name: Build ImmortalWrt for 360P
 
 on:
   workflow_dispatch:

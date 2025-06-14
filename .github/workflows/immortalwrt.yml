@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for 360P
+name: Build ImmortalWrt for 360P2 (Ubuntu 22.04)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
-    timeout-minutes: 180  # 延长超时时间
+    runs-on: ubuntu-22.04  # 使用新环境
+    timeout-minutes: 180
     
-    # 修复编译环境的核心设置
     env:
       FORCE_UNSAFE_CONFIGURE: 1
       DEBIAN_FRONTEND: noninteractive
@@ -22,91 +21,89 @@ jobs:
         repository: immortalwrt/immortalwrt
         ref: v23.05.3
         submodules: recursive
-        # 关键修复：禁用文件系统缓存
         fetch-depth: 0
 
-    - name: Install Build Dependencies (Fixed)
+    - name: Install Build Dependencies (Ubuntu 22.04)
       run: |
-        sudo -E apt-get -y update
-        sudo -E apt-get -y install build-essential libncurses5-dev zlib1g-dev gawk \
-        git gettext libssl-dev libxml-parser-perl unzip python3 rsync wget \
-        subversion mercurial gperf bison flex texinfo dos2unix libtool-bin
+        sudo apt-get update
+        # Ubuntu 22.04 专属依赖
+        sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext \
+        libssl-dev libxml-parser-perl unzip python3 rsync wget subversion mercurial \
+        gperf bison flex texinfo dos2unix libtool-bin u-boot-tools lzma-dev lzma \
+        zlib1g-dev libc6-dev-i386 g++-multilib gawk
         
+        # 修复 Python 3 兼容性
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+        python -m pip install --upgrade pip
+        pip install future
+
         # 修复时间同步问题
         sudo timedatectl set-ntp on
         sudo service systemd-timesyncd restart
 
-    - name: Setup Compiler Cache
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.ccache
-          build_dir/
-          staging_dir/
-          tmp/
-        key: ${{ runner.os }}-ccache-${{ hashFiles('**/.config') }}
-
     - name: Apply Critical Patches
       run: |
-        # 修复 procd 编译问题
+        # procd 修复
         sed -i 's/-Werror //' package/system/procd/Makefile
         
-        # 修复 hostapd 兼容性问题
+        # hostapd 修复
         echo "CONFIG_WPA_MSG_MIN_PRIORITY=3" >> package/network/services/hostapd/files/hostapd-full.config
         
-        # 修复 opkg 依赖链
+        # opkg 修复
         sed -i '/PKG_CHECK_MODULES/s/^/#/' package/system/opkg/configure.ac
+        
+        # Ubuntu 22.04 专属修复
+        sed -i 's/ -Wno-format-truncation//' package/libs/libnl-tiny/Makefile
+        sed -i 's/ -Wno-format-truncation//' package/network/utils/iwinfo/Makefile
 
     - name: Configure Target
       run: |
-        # 基础设备配置
+        # 基础配置
         echo "CONFIG_TARGET_ramips=y" > .config
         echo "CONFIG_TARGET_ramips_mt76x8=y" >> .config
         echo "CONFIG_TARGET_ramips_mt76x8_DEVICE_360_360p2=y" >> .config
-        
-        # 空间优化配置
         echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
-        echo "CONFIG_TARGET_IMAGES_GZIP=y" >> .config
+        
+        # 空间优化
         echo "# CONFIG_IPV6 is not set" >> .config
         echo "# CONFIG_PACKAGE_ppp is not set" >> .config
         echo "# CONFIG_PACKAGE_firewall is not set" >> .config
         
-        # 核心功能预集成
+        # 核心功能
         echo "CONFIG_PACKAGE_luci=y" >> .config
         echo "CONFIG_PACKAGE_luci-i18n-base-zh-cn=y" >> .config
         echo "CONFIG_PACKAGE_avahi-daemon=y" >> .config
         echo "CONFIG_PACKAGE_cups=y" >> .config
         echo "CONFIG_PACKAGE_kmod-usb-printer=y" >> .config
         
-        # 跳过问题模块
-        echo "# CONFIG_PACKAGE_procd is not set" >> .config  # 使用替代方案
-        echo "# CONFIG_PACKAGE_ustream-ssl is not set" >> .config
-        echo "# CONFIG_PACKAGE_uclient is not set" >> .config
-        
         # 生成配置
         make defconfig
         make oldconfig
 
-    - name: Compile Firmware (Fixed)
+    - name: Compile Firmware (Staged)
       run: |
-        # 修复并行编译问题
-        make -j1 V=sc 2>&1 | tee build.log
-        
-        # 分阶段重试编译
-        make tools/install -j$(nproc)
-        make toolchain/install -j$(nproc)
-        make package/compile -j$(nproc) V=sc || true
+        # 分阶段编译避免错误
+        make tools/compile -j$(nproc) V=sc
+        make toolchain/compile -j$(nproc) V=sc
+        make target/compile -j$(nproc) V=sc
+        make package/compile -j1 V=sc   # 关键步骤单线程
         make package/install -j1 V=sc
-        make target/install -j$(nproc)
+        make target/install -j$(nproc) V=s
 
-    - name: Check Firmware Size
+    - name: Check Firmware
       run: |
         FIRMWARE_PATH="bin/targets/ramips/mt76x8/*squashfs-sysupgrade.bin"
-        [ -f $FIRMWARE_PATH ] && echo "Firmware generated" || (cat build.log; exit 1)
+        if [ -f $FIRMWARE_PATH ]; then
+          SIZE=$(stat -c%s $FIRMWARE_PATH)
+          echo "Firmware size: $SIZE bytes"
+        else
+          echo "::error::Firmware not generated!"
+          find bin/ -type f | xargs ls -lh
+          exit 1
+        fi
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
-      if: success()
       with:
         name: immortalwrt-360p2
         path: bin/targets/ramips/mt76x8/*.bin

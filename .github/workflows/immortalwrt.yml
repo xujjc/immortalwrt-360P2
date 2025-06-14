@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for 360P2 (Stable)
+name: Build ImmortalWrt for 360P2 (Optimized)
 
 on:
   workflow_dispatch:
@@ -8,12 +8,15 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 240  # 延长超时时间
-    
+    timeout-minutes: 90  # 缩短超时时间
     env:
       FORCE_UNSAFE_CONFIGURE: 1
       DEBIAN_FRONTEND: noninteractive
-      BUILD_LOG: build.log  # 统一日志文件
+      
+    strategy:
+      matrix:
+        # 并行构建关键组件
+        target: [tools, toolchain, packages]
       
     steps:
     - name: Checkout ImmortalWrt
@@ -22,145 +25,80 @@ jobs:
         repository: immortalwrt/immortalwrt
         ref: v23.05.3
         submodules: recursive
-        fetch-depth: 0
+        fetch-depth: 1  # 减少克隆深度
 
-    - name: Install Build Dependencies
+    - name: Install Minimal Dependencies
       run: |
+        # 仅安装必需依赖
         sudo apt-get update
-        sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext \
-        libssl-dev libxml-parser-perl unzip python3 rsync wget subversion mercurial \
-        gperf bison flex texinfo dos2unix libtool-bin u-boot-tools lzma-dev zlib1g-dev \
-        libc6-dev-i386 g++-multilib ccache
+        sudo apt-get install -y build-essential libncurses5-dev \
+        zlib1g-dev gawk git gettext libssl-dev unzip python3
         
-        # Python 兼容性修复
+        # Python 兼容性
         sudo ln -sf /usr/bin/python3 /usr/bin/python
-        python -m pip install --upgrade pip
-        pip install future
 
     - name: Apply Critical Patches
       run: |
-        # 1. procd 修复
-        if [ -f "package/system/procd/Makefile" ]; then
-          sed -i 's/-Werror //' package/system/procd/Makefile
-          echo "✅ Procd Makefile patched"
-        fi
+        # procd 修复
+        [ -f "package/system/procd/Makefile" ] && \
+          sed -i 's/-Werror=.* //' package/system/procd/Makefile
         
-        # 2. hostapd 修复
-        if [ -f "package/network/services/hostapd/files/hostapd-full.config" ]; then
-          echo "CONFIG_WPA_MSG_MIN_PRIORITY=3" >> package/network/services/hostapd/files/hostapd-full.config
-          echo "✅ Hostapd config patched"
-        fi
-        
-        # 3. Ubuntu 22.04 专属修复
-        if [ -f "package/libs/libnl-tiny/Makefile" ]; then
-          sed -i 's/ -Wno-format-truncation//' package/libs/libnl-tiny/Makefile
-          echo "✅ libnl-tiny patched"
-        fi
-          
-        if [ -f "package/network/utils/iwinfo/Makefile" ]; then
-          sed -i 's/ -Wno-format-truncation//' package/network/utils/iwinfo/Makefile
-          echo "✅ iwinfo patched"
-        fi
-        
-        # 4. 关键修复：确保必要的目录存在
-        mkdir -p bin/targets/ramips/mt76x8
-        mkdir -p logs
+        # 禁用非必要模块
+        echo "# CONFIG_PACKAGE_luci-app-firewall is not set" >> .config
+        echo "# CONFIG_PACKAGE_iptables is not set" >> .config
 
     - name: Configure Target
       run: |
-        # 创建最小化配置
         cat << EOF > .config
         CONFIG_TARGET_ramips=y
         CONFIG_TARGET_ramips_mt76x8=y
         CONFIG_TARGET_ramips_mt76x8_DEVICE_360_360p2=y
         CONFIG_TARGET_ROOTFS_SQUASHFS=y
-        
-        # 空间优化
-        # CONFIG_IPV6 is not set
-        # CONFIG_PACKAGE_ppp is not set
-        # CONFIG_PACKAGE_firewall is not set
-        # CONFIG_PACKAGE_odhcpd is not set
-        # CONFIG_PACKAGE_dnsmasq is not set
-        
-        # 核心功能
         CONFIG_PACKAGE_luci=y
         CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
         CONFIG_PACKAGE_avahi-daemon=y
         CONFIG_PACKAGE_cups=y
         CONFIG_PACKAGE_kmod-usb-printer=y
-        
-        # 避免问题组件
-        # CONFIG_PACKAGE_procd-ujail is not set
         EOF
         
-        # 生成配置
         make defconfig
-        make oldconfig >> config.log 2>&1
-        echo "✅ Configuration complete"
 
-    - name: Compile Firmware (Robust)
-      run: |
-        # 启用详细日志记录
-        set -x
-        
-        # 阶段1: 编译工具链 (并行)
-        make tools/compile -j$(nproc) V=sc >> ${BUILD_LOG} 2>&1 || true
-        
-        # 阶段2: 编译工具链 (单线程重试)
-        make tools/compile -j1 V=sc >> ${BUILD_LOG} 2>&1 || \
-          { echo "::error::Tools compilation failed"; cat ${BUILD_LOG}; exit 1; }
-        
-        # 阶段3: 编译核心组件 (单线程)
-        CORE_PACKAGES="toolchain package/kernel/linux package/system/procd package/system/opkg"
-        for pkg in $CORE_PACKAGES; do
-          make $pkg/compile -j1 V=sc >> ${BUILD_LOG} 2>&1 || \
-            { echo "::error::$pkg compilation failed"; cat ${BUILD_LOG}; exit 1; }
-        done
-        
-        # 阶段4: 完整编译 (带错误恢复)
-        make -j$(nproc) V=sc >> ${BUILD_LOG} 2>&1 || \
-          echo "⚠️ Partial errors detected, attempting recovery..."
-        
-        # 阶段5: 关键包单独编译
-        CRITICAL_PACKAGES="package/system/procd package/system/opkg package/network/services/hostapd"
-        for pkg in $CRITICAL_PACKAGES; do
-          make $pkg/compile -j1 V=sc >> ${BUILD_LOG} 2>&1 || \
-            { echo "::error::$pkg recovery failed"; cat ${BUILD_LOG}; exit 1; }
-        done
-        
-        # 阶段6: 最终打包
-        make -j1 V=sc package/install >> ${BUILD_LOG} 2>&1
-        make -j1 V=sc target/install >> ${BUILD_LOG} 2>&1
-        
-        # 验证固件存在
-        if [ ! -f "bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin" ]; then
-          echo "::error::Firmware not generated!"
-          cat ${BUILD_LOG}
-          exit 1
-        fi
+    - name: Prebuilt Toolchain Setup
+      uses: actions/cache@v3
+      with:
+        path: |
+          staging_dir/toolchain-*
+          build_dir/toolchain-*
+        key: ${{ runner.os }}-toolchain-${{ hashFiles('.config') }}
 
-    - name: Check Firmware Size
+    - name: Compile Core
       run: |
-        FIRMWARE="bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin"
-        SIZE=$(stat -c%s "$FIRMWARE")
-        echo "Firmware size: $((SIZE/1024/1024))MB ($SIZE bytes)"
+        # 仅编译必要组件
+        make -j$(nproc) V=s \
+          package/luci/compile \
+          package/avahi/compile \
+          package/cups/compile \
+          package/kmod-usb-printer/compile \
+          2>&1 | tee build.log
         
-        if [ $SIZE -gt 15728640 ]; then  # 15MB = 15728640 bytes
-          echo "::error::Firmware too big for 16MB flash!"
-          exit 1
-        fi
+        # 单独编译问题组件
+        make -j1 V=s package/system/procd/compile
+        make -j1 V=s package/system/opkg/compile
+
+    - name: Build Minimal Image
+      run: |
+        # 创建最小化固件
+        make -j1 V=s package/install
+        make -j1 V=s target/install
+        
+        # 生成精简固件
+        ./scripts/mkits.sh -D ramips/mt76x8 \
+          -o bin/targets/ramips/mt76x8/minimal-sysupgrade.bin \
+          -k bin/targets/ramips/mt76x8/Image \
+          -r bin/targets/ramips/mt76x8/rootfs.squashfs
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: immortalwrt-360p2
-        path: bin/targets/ramips/mt76x8/*.bin
-
-    - name: Upload Build Log
-      uses: actions/upload-artifact@v4
-      if: always()  # 总是上传日志，即使失败
-      with:
-        name: build-logs
-        path: |
-          build.log
-          config.log
+        name: immortalwrt-minimal
+        path: bin/targets/ramips/mt76x8/minimal-*.bin

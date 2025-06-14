@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for 360P2 (Ultimate)
+name: Build ImmortalWrt for 360P2 (Fixed Prebuilt)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30  # 超短超时确保快速失败
+    timeout-minutes: 15  # 更短的超时时间
     
     steps:
     - name: Checkout ImmortalWrt
@@ -14,23 +14,22 @@ jobs:
       with:
         repository: immortalwrt/immortalwrt
         ref: v23.05.3
-        submodules: false  # 禁用子模块
         path: source
         fetch-depth: 1
 
-    - name: Setup Prebuilt Environment
+    - name: Create Directory Structure
       run: |
-        # 创建预编译环境
-        mkdir -p source/staging_dir/{host,target-mipsel_24kc_musl}
-        mkdir -p source/build_dir/host
-        mkdir -p source/bin
-        
-        # 下载预编译工具链
+        # 创建必要的目录结构
+        mkdir -p source/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl
+        mkdir -p source/build_dir
+        mkdir -p source/bin/targets/ramips/mt76x8
+
+    - name: Download Prebuilt Toolchain
+      run: |
+        cd source/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl
         wget https://downloads.openwrt.org/releases/23.05.3/targets/ramips/mt76x8/openwrt-toolchain-23.05.3-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-        tar -xf openwrt-toolchain-*.tar.xz -C source/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl --strip-components=2
-        
-        # 设置符号链接
-        ln -s $(pwd)/source/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl source/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl
+        tar -xvf openwrt-toolchain-*.tar.xz --strip-components=1
+        rm openwrt-toolchain-*.tar.xz
 
     - name: Configure Minimal Build
       run: |
@@ -49,11 +48,16 @@ jobs:
         CONFIG_PACKAGE_kmod-usb-printer=y
         EOF
         
+        # 应用配置
         make defconfig
 
     - name: Build Only Required Packages
       run: |
         cd source
+        
+        # 设置环境变量
+        export STAGING_DIR=$(pwd)/staging_dir
+        export PATH=$STAGING_DIR/toolchain-mipsel_24kc_gcc-12.3.0_musl/bin:$PATH
         
         # 仅编译核心包
         make -j$(nproc) package/luci/compile
@@ -61,20 +65,26 @@ jobs:
         make -j$(nproc) package/cups/compile
         make -j$(nproc) package/kmod-usb-printer/compile
         
-        # 创建固件结构
-        mkdir -p bin/targets/ramips/mt76x8
-        cp build_dir/target-*/linux-ramips_mt76x8/vmlinux bin/targets/ramips/mt76x8/
-        cp build_dir/target-*/root-ramips/root.squashfs bin/targets/ramips/mt76x8/rootfs.squashfs
+        # 获取预编译内核（避免编译内核）
+        wget -O bin/targets/ramips/mt76x8/vmlinux https://downloads.openwrt.org/releases/23.05.3/targets/ramips/mt76x8/openwrt-23.05.3-ramips-mt76x8-vmlinux.bin
         
-        # 生成固件
-        ./staging_dir/host/bin/padjffs2 bin/targets/ramips/mt76x8/vmlinux
-        ./staging_dir/host/bin/mksquashfs4 $(pwd)/build_dir/target-*/root-ramips/ $(pwd)/bin/targets/ramips/mt76x8/root.squashfs -noappend -root-owned -comp xz
-        ./staging_dir/host/bin/mkimage -A mips -O linux -T kernel -C none -a 0x80000000 -e 0x80000000 -n "MIPS OpenWrt Linux-5.10" -d bin/targets/ramips/mt76x8/vmlinux bin/targets/ramips/mt76x8/uImage.bin
-        ./staging_dir/host/bin/mkimage -A mips -O linux -T filesystem -C none -a 0 -e 0 -n "OpenWrt" -d bin/targets/ramips/mt76x8/root.squashfs bin/targets/ramips/mt76x8/rootfs.bin
-        cat bin/targets/ramips/mt76x8/uImage.bin bin/targets/ramips/mt76x8/rootfs.bin > bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin
+        # 创建根文件系统
+        mkdir -p rootfs
+        cp -r staging_dir/target-mipsel_24kc_musl/root-ramips/* rootfs/
+        
+        # 添加编译的包到根文件系统
+        for pkg in luci avahi-daemon cups kmod-usb-printer; do
+          cp build_dir/target-*/$pkg-*/ipkg/*/*.ipk rootfs/usr/lib/opkg/
+        done
+        
+        # 生成根文件系统镜像
+        $STAGING_DIR/host/bin/mksquashfs4 rootfs bin/targets/ramips/mt76x8/root.squashfs -noappend -root-owned -comp xz
+        
+        # 组合固件
+        cat bin/targets/ramips/mt76x8/vmlinux bin/targets/ramips/mt76x8/root.squashfs > bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: immortalwrt-360p2
-        path: source/bin/targets/ramips/mt76x8/*.bin
+        path: source/bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin

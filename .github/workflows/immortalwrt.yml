@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for 360P2 (Ubuntu 22.04)
+name: Build ImmortalWrt for 360P2 (Fixed)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04  # 使用新环境
+    runs-on: ubuntu-22.04
     timeout-minutes: 180
     
     env:
@@ -23,16 +23,15 @@ jobs:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Install Build Dependencies (Ubuntu 22.04)
+    - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        # Ubuntu 22.04 专属依赖
         sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext \
         libssl-dev libxml-parser-perl unzip python3 rsync wget subversion mercurial \
-        gperf bison flex texinfo dos2unix libtool-bin u-boot-tools lzma-dev lzma \
-        zlib1g-dev libc6-dev-i386 g++-multilib gawk
+        gperf bison flex texinfo dos2unix libtool-bin u-boot-tools lzma-dev zlib1g-dev \
+        libc6-dev-i386 g++-multilib
         
-        # 修复 Python 3 兼容性
+        # Python 兼容性修复
         sudo ln -sf /usr/bin/python3 /usr/bin/python
         python -m pip install --upgrade pip
         pip install future
@@ -40,17 +39,18 @@ jobs:
     - name: Apply Critical Patches
       run: |
         # procd 修复
-        sed -i 's/-Werror //' package/system/procd/Makefile
+        [ -f "package/system/procd/Makefile" ] && sed -i 's/-Werror //' package/system/procd/Makefile
         
         # hostapd 修复
-        echo "CONFIG_WPA_MSG_MIN_PRIORITY=3" >> package/network/services/hostapd/files/hostapd-full.config
-        
-        # opkg 修复
-        sed -i '/PKG_CHECK_MODULES/s/^/#/' package/system/opkg/configure.ac
+        [ -f "package/network/services/hostapd/files/hostapd-full.config" ] && \
+          echo "CONFIG_WPA_MSG_MIN_PRIORITY=3" >> package/network/services/hostapd/files/hostapd-full.config
         
         # Ubuntu 22.04 专属修复
-        sed -i 's/ -Wno-format-truncation//' package/libs/libnl-tiny/Makefile
-        sed -i 's/ -Wno-format-truncation//' package/network/utils/iwinfo/Makefile
+        [ -f "package/libs/libnl-tiny/Makefile" ] && \
+          sed -i 's/ -Wno-format-truncation//' package/libs/libnl-tiny/Makefile
+          
+        [ -f "package/network/utils/iwinfo/Makefile" ] && \
+          sed -i 's/ -Wno-format-truncation//' package/network/utils/iwinfo/Makefile
 
     - name: Configure Target
       run: |
@@ -64,6 +64,7 @@ jobs:
         echo "# CONFIG_IPV6 is not set" >> .config
         echo "# CONFIG_PACKAGE_ppp is not set" >> .config
         echo "# CONFIG_PACKAGE_firewall is not set" >> .config
+        echo "# CONFIG_PACKAGE_odhcpd is not set" >> .config
         
         # 核心功能
         echo "CONFIG_PACKAGE_luci=y" >> .config
@@ -72,29 +73,37 @@ jobs:
         echo "CONFIG_PACKAGE_cups=y" >> .config
         echo "CONFIG_PACKAGE_kmod-usb-printer=y" >> .config
         
+        # 避免问题组件
+        echo "# CONFIG_PACKAGE_procd-ujail is not set" >> .config
+        
         # 生成配置
         make defconfig
         make oldconfig
 
-    - name: Compile Firmware (Staged)
+    - name: Compile Firmware
       run: |
-        # 分阶段编译避免错误
-        make tools/compile -j$(nproc) V=sc
-        make toolchain/compile -j$(nproc) V=sc
-        make target/compile -j$(nproc) V=sc
-        make package/compile -j1 V=sc   # 关键步骤单线程
-        make package/install -j1 V=sc
-        make target/install -j$(nproc) V=s
+        # 分阶段编译
+        make tools/compile -j$(nproc) V=s
+        make toolchain/compile -j$(nproc) V=s
+        make -j$(nproc) V=s 2>&1 | tee build.log || true
+        
+        # 关键组件单独编译
+        make -j1 V=s package/system/procd/compile
+        make -j1 V=s package/system/opkg/compile
+        
+        # 最终打包
+        make -j1 V=s package/install
+        make -j1 V=s target/install
 
     - name: Check Firmware
       run: |
-        FIRMWARE_PATH="bin/targets/ramips/mt76x8/*squashfs-sysupgrade.bin"
-        if [ -f $FIRMWARE_PATH ]; then
-          SIZE=$(stat -c%s $FIRMWARE_PATH)
-          echo "Firmware size: $SIZE bytes"
+        FIRMWARE="bin/targets/ramips/mt76x8/immortalwrt-ramips-mt76x8-360_360p2-squashfs-sysupgrade.bin"
+        if [ -f "$FIRMWARE" ]; then
+          SIZE=$(stat -c%s "$FIRMWARE")
+          echo "Firmware generated: $SIZE bytes"
         else
-          echo "::error::Firmware not generated!"
-          find bin/ -type f | xargs ls -lh
+          echo "::error::Firmware not found!"
+          find bin/targets/ramips/mt76x8/ -type f | xargs ls -lh
           exit 1
         fi
 
